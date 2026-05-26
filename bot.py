@@ -17,7 +17,7 @@ API_ID        = int(os.environ.get("API_ID", "22062932"))
 API_HASH      = os.environ.get("API_HASH", "fa408cb00846e274bd4f79d219493923")
 BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8978544822:AAE3vbDBZeCYSNPjJnOrJTMLZ-Ue5_WMzWk")
 OWNER_ID      = int(os.environ.get("OWNER_ID", "6514156935"))
-CHANNEL       = os.environ.get("CHANNEL", "4AM Pumpfun Volume Signal")
+CHANNEL       = os.environ.get("CHANNEL", "pumpfunvolumeby4AM")
 MIN_SCORE     = int(os.environ.get("MIN_SCORE", "60"))   # alert threshold
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
