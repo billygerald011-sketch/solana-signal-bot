@@ -77,6 +77,7 @@ def save_signal(signal: dict, score: dict):
     data.append(entry)
     _save(data)
     log.info(f"Saved signal #{entry['id']}: {entry['name']} (score: {entry['score_total']})")
+    return entry['id']
 
 
 def update_price(ca: str, current_mcap: float, multiplier: float):
