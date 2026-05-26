@@ -6,6 +6,7 @@ import logging
 import aiohttp
 from datetime import datetime
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telegram import Bot
 from telegram.constants import ParseMode
 from scorer import score_signal
@@ -18,7 +19,8 @@ API_HASH      = os.environ.get("API_HASH", "fa408cb00846e274bd4f79d219493923")
 BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8978544822:AAE3vbDBZeCYSNPjJnOrJTMLZ-Ue5_WMzWk")
 OWNER_ID      = int(os.environ.get("OWNER_ID", "6514156935"))
 CHANNEL       = os.environ.get("CHANNEL", "pumpfunvolumeby4AM")
-MIN_SCORE     = int(os.environ.get("MIN_SCORE", "60"))   # alert threshold
+MIN_SCORE      = int(os.environ.get("MIN_SCORE", "60"))
+SESSION_STRING = os.environ.get("SESSION_STRING", "1BJWap1wBu6lWuGrvMz3YfdlyzqpKN-kjP2iG4zWB2XC_eeLjNKYMA61n0aZHynzwv75SFBayEywEbzSE3994Iiaxpunc3jSWnJM709w91TBHIMUExs_aMIjMxsJY5xNK12wigG80wRmEJUzZ5koDFg0HjGl28gsVo-MwSzwnZLGF0oQpLRsV97jHpv2z-vwyHiGZE-8cd72FdMdo2a8xzWz7QI1EYGhlzOjgKDYAJPra3i-E759-GJKfTW6evJyWFIaRaNszXwCANWV75O-7Mdh4uWJ-3uqcDp_2vbVQ7J9PMfKRdQsakeGRIKFlLpoAMuHHK_HNn9hdgveJkoK-zK6Zb3c8ANo=")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -196,8 +198,8 @@ async def daily_summary_loop():
 # ── Main Listener ─────────────────────────────────────────────────────────────
 async def main():
     log.info("Starting Solana Signal Bot...")
-    client = TelegramClient('session', API_ID, API_HASH)
-    await client.start()
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    await client.start(bot_token=None)
     log.info("Telegram client connected.")
 
     await alert_bot.send_message(
