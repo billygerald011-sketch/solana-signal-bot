@@ -150,27 +150,35 @@ def check_same_meta(signal: dict) -> dict:
 
 
 async def check_volume_velocity(session, ca: str, current_volume: int) -> dict:
-    """Check if volume is accelerating by comparing to pump.fun data."""
-    result = {'volume_accelerating': False, 'volume_velocity_score': 0}
-    try:
-        url = f"https://frontend-api.pump.fun/coins/{ca}/trades?limit=20&offset=0"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
-            if r.status == 200:
-                trades = await r.json()
-                if trades and len(trades) >= 5:
-                    # Count trades in last 5 mins vs 5 mins before that
-                    now = datetime.now(timezone.utc)
-                    recent = sum(1 for t in trades
-                                if (now - datetime.fromisoformat(
-                                    t.get('timestamp','').replace('Z','')
-                                )).total_seconds() < 300
-                                ) if trades else 0
-                    result['recent_trade_count']     = recent
-                    result['volume_accelerating']    = recent >= 5
-                    result['volume_velocity_score']  = min(recent * 10, 100)
-    except Exception as e:
-        log.warning(f"Volume velocity check failed: {e}")
-    return result
+    """
+    Get volume velocity from PumpPortal WebSocket live data.
+    Falls back to volume/mcap ratio from signal data if websocket not yet active.
+    """
+    from price_tracker import get_live_trade_count
+    live = get_live_trade_count(ca)
+    trade_count = live.get('trade_count', 0)
+    buy_count   = live.get('buy_count', 0)
+    sell_count  = live.get('sell_count', 0)
+
+    # If websocket has data use it, otherwise estimate from volume
+    if trade_count > 0:
+        return {
+            'recent_trade_count':    trade_count,
+            'buy_count':             buy_count,
+            'sell_count':            sell_count,
+            'volume_accelerating':   trade_count >= 5,
+            'volume_velocity_score': min(trade_count * 10, 100),
+        }
+
+    # Fallback — estimate from volume/mcap ratio
+    score = min(int((current_volume / 1000)), 100) if current_volume > 0 else 0
+    return {
+        'recent_trade_count':    0,
+        'buy_count':             0,
+        'sell_count':            0,
+        'volume_accelerating':   current_volume >= 30000,
+        'volume_velocity_score': score,
+    }
 
 
 async def check_all_trends(signal: dict, session: aiohttp.ClientSession) -> dict:

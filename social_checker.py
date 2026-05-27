@@ -9,6 +9,7 @@ import asyncio
 import aiohttp
 import logging
 import re
+import os
 
 log = logging.getLogger(__name__)
 
@@ -151,13 +152,20 @@ async def check_socials(signal: dict, tg_client=None) -> dict:
     ca = signal.get('ca', '')
 
     async with aiohttp.ClientSession() as session:
-        # Always fetch pump.fun data first — it has the most reliable social links
-        pumpfun_data = await get_pumpfun_data(session, ca)
+        # Fetch from pump.fun API and Helius metadata concurrently
+        pumpfun_data, helius_data = await asyncio.gather(
+            get_pumpfun_data(session, ca),
+            get_socials_from_helius(session, ca),
+            return_exceptions=True
+        )
 
-    # Merge links: pump.fun takes priority, fall back to signal message text
-    twitter_url  = pumpfun_data.get('twitter_url')  or signal.get('twitter_url', '')
-    telegram_url = pumpfun_data.get('telegram_url') or signal.get('telegram_url', '')
-    website_url  = pumpfun_data.get('website_url')  or signal.get('website_url', '')
+    pumpfun_data = pumpfun_data if isinstance(pumpfun_data, dict) else {}
+    helius_data  = helius_data  if isinstance(helius_data,  dict) else {}
+
+    # Priority: pump.fun API > Helius IPFS metadata > signal message text
+    twitter_url  = pumpfun_data.get('twitter_url')  or helius_data.get('twitter_url')  or signal.get('twitter_url', '')
+    telegram_url = pumpfun_data.get('telegram_url') or helius_data.get('telegram_url') or signal.get('telegram_url', '')
+    website_url  = pumpfun_data.get('website_url')  or helius_data.get('website_url')  or signal.get('website_url', '')
 
     log.info(f"Socials for {signal.get('name')}: twitter={bool(twitter_url)} tg={bool(telegram_url)} web={bool(website_url)}")
 
@@ -201,3 +209,53 @@ async def check_socials(signal: dict, tg_client=None) -> dict:
         'telegram_members':  tg_data.get('telegram_members', 0),
         'telegram_active':   tg_data.get('telegram_active', False),
     }
+
+
+async def get_socials_from_helius(session: aiohttp.ClientSession, ca: str) -> dict:
+    """
+    Fetch token metadata from Helius DAS API.
+    This gives us the IPFS URI which contains twitter/telegram/website.
+    """
+    result = {'twitter_url': '', 'telegram_url': '', 'website_url': '', 'image_url': ''}
+    try:
+        HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "2842e504-2c6d-41a1-b013-962ee1263e23")
+        url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+        # Use DAS getAsset to get token metadata
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAsset",
+            "params": {"id": ca}
+        }
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                data = await r.json()
+                result_data = data.get('result', {})
+
+                # Get metadata URI (IPFS link)
+                uri = result_data.get('content', {}).get('json_uri', '')
+                if uri:
+                    # Fetch the IPFS metadata JSON
+                    async with session.get(uri, timeout=aiohttp.ClientTimeout(total=8)) as meta_r:
+                        if meta_r.status == 200:
+                            meta = await meta_r.json()
+                            twitter  = meta.get('twitter', '')  or meta.get('twitter_url', '')  or ''
+                            telegram = meta.get('telegram', '') or meta.get('telegram_url', '') or ''
+                            website  = meta.get('website', '')  or meta.get('website_url', '')  or ''
+
+                            if twitter and not twitter.startswith('http'):
+                                twitter = f"https://x.com/{twitter.lstrip('@')}"
+                            if telegram and not telegram.startswith('http'):
+                                telegram = f"https://t.me/{telegram.lstrip('@')}"
+                            if website and not website.startswith('http'):
+                                website = f"https://{website}"
+
+                            result['twitter_url']  = twitter
+                            result['telegram_url'] = telegram
+                            result['website_url']  = website
+                            result['image_url']    = meta.get('image', '')
+
+    except Exception as e:
+        log.warning(f"Helius metadata fetch failed for {ca}: {e}")
+    return result
