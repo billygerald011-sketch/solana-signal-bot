@@ -1,6 +1,5 @@
 import asyncio
 import re
-import json
 import os
 import logging
 import aiohttp
@@ -10,6 +9,9 @@ from telethon.sessions import StringSession
 from telegram import Bot
 from telegram.constants import ParseMode
 from tracker import save_signal, update_price, get_all_signals, get_stats
+from social_checker import check_socials
+from trend_checker import check_all_trends
+from safety_checker import run_safety_checks
 
 # ── Config ────────────────────────────────────────────────────────────────────
 API_ID         = int(os.environ.get("API_ID", "22062932"))
@@ -21,8 +23,8 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "1BJWap1wBu6lWuGrvMz3YfdlyzqpK
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
-
 alert_bot = Bot(token=BOT_TOKEN)
+
 
 # ── Signal Parser ─────────────────────────────────────────────────────────────
 def parse_signal(text: str) -> dict | None:
@@ -44,6 +46,10 @@ def parse_signal(text: str) -> dict | None:
         dev = re.search(r'Dev[:\s].*?\(\s*💰\s*(\d+(?:\.\d+)?)%\)', text)
         if dev: data['dev_pct'] = float(dev.group(1))
 
+        # Extract dev wallet address
+        dev_wallet = re.search(r'Dev[:\s]+([A-Za-z0-9]{32,44})', text)
+        if dev_wallet: data['dev_wallet'] = dev_wallet.group(1)
+
         holders = re.search(r'Holders[:\s]*(\d+)', text)
         if holders: data['holders'] = int(holders.group(1))
 
@@ -61,8 +67,10 @@ def parse_signal(text: str) -> dict | None:
 
         x_profile = re.search(r'(https?://(?:twitter|x)\.com/\S+)', text)
         website   = re.search(r'(https?://(?!t\.me|pump\.fun|twitter|x\.com)\S+\.\S+)', text)
-        if x_profile: data['twitter_url'] = x_profile.group(1)
-        if website:   data['website_url']  = website.group(1)
+        tg_link   = re.search(r'(https?://t\.me/\S+)', text)
+        if x_profile: data['twitter_url']  = x_profile.group(1)
+        if website:   data['website_url']   = website.group(1)
+        if tg_link:   data['telegram_url']  = tg_link.group(1)
 
         if 'ca' not in data or 'marketcap' not in data:
             return None
@@ -75,47 +83,91 @@ def parse_signal(text: str) -> dict | None:
         return None
 
 
-# ── Notify owner of every caught signal ──────────────────────────────────────
-async def notify_signal(signal: dict, signal_id: int):
-    has_twitter = '✅' if signal.get('twitter_url') else '❌'
-    has_website = '✅' if signal.get('website_url') else '❌'
+# ── Notify ────────────────────────────────────────────────────────────────────
+async def notify_signal(signal: dict, socials: dict, trends: dict, safety: dict, signal_id: int):
+    # Social strings
+    twitter_str = f"✅ {socials.get('twitter_followers',0):,} followers" if socials.get('has_twitter') else '❌'
+    website_str = '✅ Live' if socials.get('website_live') else '❌'
+    tg_str      = f"✅ {socials.get('telegram_members',0):,} members" if socials.get('telegram_members',0) > 0 else ('✅' if socials.get('telegram_url') else '❌')
+
+    # Trend strings
+    twitter_buzz  = f"🔥 {trends.get('recent_tweet_count',0)} tweets" if trends.get('trending_on_twitter') else f"💤 {trends.get('recent_tweet_count',0)} tweets"
+    meta_str      = f"🔥 {trends.get('meta_theme','').upper()} meta hot ({trends.get('meta_win_rate',0)}% win rate)" if trends.get('meta_hot') else (f"Theme: {trends.get('meta_theme','none')}" if trends.get('meta_theme') else 'No theme detected')
+    velocity_str  = f"🚀 Accelerating ({trends.get('recent_trade_count',0)} trades/5m)" if trends.get('volume_accelerating') else f"📊 {trends.get('recent_trade_count',0)} trades/5m"
+
+    # Safety strings
+    honeypot_str  = "🚨 HONEYPOT" if safety.get('is_honeypot') else "✅ Clean"
+    rugcheck_str  = safety.get('rugcheck_rating', 'unknown')
+    dev_str       = f"🚨 Serial rugger ({safety.get('dev_rug_rate',0)}% rug rate)" if safety.get('dev_is_serial_rugger') else f"✅ {safety.get('dev_previous_tokens',0)} prev tokens"
+
+    # Red flags
+    red_flags = safety.get('red_flags', [])
+    flags_str = '\n'.join(red_flags) if red_flags else '✅ None'
+
     msg = (
         f"📡 *SIGNAL #{signal_id} CAUGHT*\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 *{signal.get('name', 'Unknown')}*\n"
-        f"`{signal.get('ca', '')}`\n\n"
-        f"💰 Mcap: *${signal.get('marketcap', 0):,}*\n"
-        f"⏱ Age: *{signal.get('age_minutes', 0):.0f}m*\n"
-        f"👥 Holders: *{signal.get('holders', 0)}*\n"
-        f"🏆 Top10: *{signal.get('top10_pct', 0)}%*\n"
-        f"🚀 Volume: *${signal.get('volume', 0):,}*\n"
-        f"💧 Liquidity: *${signal.get('liquidity', 0):,}*\n"
-        f"📈 Bonding: *{signal.get('bonding_curve', 0)}%*\n"
-        f"👨‍💻 Dev: *{signal.get('dev_pct', 0)}%*\n\n"
-        f"🐦 Twitter: {has_twitter}  🌐 Website: {has_website}\n\n"
-        f"📝 *Paper trade: $10 entered*\n"
-        f"🎯 Target 2x @ ${signal.get('marketcap', 0) * 2:,}\n\n"
-        f"🔗 [View on pump.fun](https://pump.fun/{signal.get('ca', '')})"
+        f"🪙 *{signal.get('name','Unknown')}*\n"
+        f"`{signal.get('ca','')}`\n\n"
+        f"📊 *ON-CHAIN*\n"
+        f"💰 Mcap: *${signal.get('marketcap',0):,}*\n"
+        f"⏱ Age: *{signal.get('age_minutes',0):.0f}m*\n"
+        f"👥 Holders: *{signal.get('holders',0)}* (+{safety.get('unique_buyers_5m',0)}/5m)\n"
+        f"🏆 Top10: *{signal.get('top10_pct',0)}%*\n"
+        f"🚀 Volume: *${signal.get('volume',0):,}*\n"
+        f"💧 Liquidity: *${signal.get('liquidity',0):,}*\n"
+        f"📈 Bonding: *{signal.get('bonding_curve',0)}%*\n"
+        f"👨‍💻 Dev: *{signal.get('dev_pct',0)}%*\n\n"
+        f"🌐 *SOCIALS*\n"
+        f"🐦 Twitter: {twitter_str}\n"
+        f"🌍 Website: {website_str}\n"
+        f"💬 Telegram: {tg_str}\n"
+        f"💭 pump.fun replies: {socials.get('pumpfun_replies',0)}\n\n"
+        f"🔥 *TRENDING*\n"
+        f"Twitter: {twitter_buzz}\n"
+        f"Meta: {meta_str}\n"
+        f"Volume: {velocity_str}\n"
+        f"Front page: {'✅ #'+str(trends.get('front_page_rank')) if trends.get('on_front_page') else '❌'}\n\n"
+        f"🛡 *SAFETY*\n"
+        f"Honeypot: {honeypot_str}\n"
+        f"Rugcheck: {rugcheck_str}\n"
+        f"Dev history: {dev_str}\n\n"
+        f"🚩 *RED FLAGS*\n{flags_str}\n\n"
+        f"📝 *Paper: $10 entered @ ${signal.get('marketcap',0):,}*\n"
+        f"🎯 2x target: ${signal.get('marketcap',0)*2:,}\n"
+        f"⏳ Tracking 48hrs\n\n"
+        f"🔗 [pump.fun](https://pump.fun/{signal.get('ca','')})"
     )
     try:
         await alert_bot.send_message(chat_id=OWNER_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        log.error(f"Failed to send alert: {e}")
+        log.error(f"Alert failed: {e}")
 
 
 # ── Price Checker ─────────────────────────────────────────────────────────────
 async def check_prices_loop():
     while True:
-        await asyncio.sleep(300)  # every 5 mins
+        await asyncio.sleep(300)
         signals = get_all_signals(active_only=True)
         for sig in signals:
             try:
+                entry_time   = datetime.fromisoformat(sig['timestamp'])
+                mins_elapsed = (datetime.utcnow() - entry_time).total_seconds() / 60
+
+                if   mins_elapsed <= 120:  check_now = True
+                elif mins_elapsed <= 360:  check_now = int(mins_elapsed) % 15 < 5
+                elif mins_elapsed <= 1440: check_now = int(mins_elapsed) % 30 < 5
+                else:                      check_now = int(mins_elapsed) % 60 < 5
+
+                if not check_now:
+                    continue
+
                 ca = sig['ca']
                 async with aiohttp.ClientSession() as session:
                     url = f"https://frontend-api.pump.fun/coins/{ca}"
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                         if r.status == 200:
-                            d = await r.json()
+                            d            = await r.json()
                             current_mcap = d.get('usd_market_cap', 0)
                             entry_mcap   = sig['marketcap']
                             if entry_mcap > 0:
@@ -129,6 +181,7 @@ async def check_prices_loop():
                                             text=(
                                                 f"🎯 *{sig['name']}* hit *{milestone}x!*\n"
                                                 f"Entry: ${entry_mcap:,} → Now: ${current_mcap:,}\n"
+                                                f"Time: {round(mins_elapsed)}m after signal\n"
                                                 f"`{ca}`\n"
                                                 f"[pump.fun](https://pump.fun/{ca})"
                                             ),
@@ -146,11 +199,12 @@ async def daily_summary_loop():
         msg = (
             f"📊 *DAILY SUMMARY*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📡 Signals caught: *{stats['total']}*\n"
+            f"📡 Total signals: *{stats['total']}*\n"
             f"2️⃣  Hit 2x: *{stats['hit_2x']}* ({stats['rate_2x']}%)\n"
             f"5️⃣  Hit 5x: *{stats['hit_5x']}* ({stats['rate_5x']}%)\n"
             f"🔟 Hit 10x: *{stats['hit_10x']}* ({stats['rate_10x']}%)\n"
             f"💀 Rugged: *{stats['rugged']}*\n"
+            f"⏱ Avg time to 2x: *{stats['avg_time_to_2x']}*\n"
             f"💵 Paper P&L: *${stats['paper_profit']:.2f}*\n"
             f"🏆 Best pick: *{stats['best_pick']}*"
         )
@@ -159,7 +213,7 @@ async def daily_summary_loop():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("Starting Solana Signal Bot — PHASE 1 DATA COLLECTION MODE")
+    log.info("Starting Solana Signal Bot — PHASE 1 FULL DATA COLLECTION")
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start(bot_token=None)
     log.info("Telegram client connected.")
@@ -167,15 +221,16 @@ async def main():
     await alert_bot.send_message(
         chat_id=OWNER_ID,
         text=(
-            "🤖 *Solana Signal Bot LIVE — Phase 1*\n"
+            "🤖 *Solana Signal Bot LIVE — Phase 1 Full*\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "📡 Listening to 4AM channel\n"
-            "📝 Catching ALL signals — no filter\n"
-            "💵 Paper trading $10 on every signal\n"
-            "📊 Tracking 5m/15m/30m/1h/2h prices\n"
-            "🎯 Alerting you on 2x/5x/10x milestones\n"
-            "📈 Daily summary every 24hrs\n\n"
-            "Let the data collection begin! 🚀"
+            "📡 Catching ALL signals\n"
+            "💵 Paper trading $10 per signal\n"
+            "🌐 Socials: Twitter + Website + Telegram\n"
+            "🔥 Trends: Twitter buzz + Meta + Volume velocity\n"
+            "🛡 Safety: Honeypot + Rugcheck + Dev history\n"
+            "⏳ Tracking prices for 48hrs\n"
+            "💾 All data saved to persistent storage\n\n"
+            "Every stone is being turned 🚀"
         ),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -185,19 +240,58 @@ async def main():
         text = event.message.message
         if 'Marketcap' not in text:
             return
-
         log.info("Signal received, parsing...")
         signal = parse_signal(text)
         if not signal:
             log.warning("Could not parse signal")
             return
 
-        signal_id = save_signal(signal, {
-            'onchain': 0, 'narrative': 0, 'social': 0,
-            'total': 0, 'red_flags': []
+        async with aiohttp.ClientSession() as session:
+            socials, trends, safety = await asyncio.gather(
+                check_socials(signal, tg_client=client),
+                check_all_trends(signal, session),
+                run_safety_checks(signal, session),
+                return_exceptions=True
+            )
+
+        socials = socials if isinstance(socials, dict) else {}
+        trends  = trends  if isinstance(trends,  dict) else {}
+        safety  = safety  if isinstance(safety,  dict) else {}
+
+        # Merge all data into signal for storage
+        signal.update({
+            'telegram_url':          socials.get('telegram_url', signal.get('telegram_url', '')),
+            'telegram_members':      socials.get('telegram_members', 0),
+            'pumpfun_replies':       socials.get('pumpfun_replies', 0),
+            'twitter_followers':     socials.get('twitter_followers', 0),
+            'website_live':          socials.get('website_live', False),
+            'trending_on_twitter':   trends.get('trending_on_twitter', False),
+            'recent_tweet_count':    trends.get('recent_tweet_count', 0),
+            'meta_hot':              trends.get('meta_hot', False),
+            'meta_theme':            trends.get('meta_theme'),
+            'meta_win_rate':         trends.get('meta_win_rate', 0),
+            'volume_accelerating':   trends.get('volume_accelerating', False),
+            'volume_velocity_score': trends.get('volume_velocity_score', 0),
+            'recent_trade_count':    trends.get('recent_trade_count', 0),
+            'on_front_page':         trends.get('on_front_page', False),
+            'front_page_rank':       trends.get('front_page_rank'),
+            'king_of_hill':          trends.get('king_of_hill', False),
+            'google_interest':       trends.get('google_interest', 0),
+            'is_honeypot':           safety.get('is_honeypot', False),
+            'rugcheck_score':        safety.get('rugcheck_score'),
+            'rugcheck_rating':       safety.get('rugcheck_rating', 'unknown'),
+            'rugcheck_risks':        safety.get('rugcheck_risks', []),
+            'dev_previous_tokens':   safety.get('dev_previous_tokens', 0),
+            'dev_rug_rate':          safety.get('dev_rug_rate', 0),
+            'dev_is_serial_rugger':  safety.get('dev_is_serial_rugger', False),
+            'unique_buyers_5m':      safety.get('unique_buyers_5m', 0),
+            'holder_growth_fast':    safety.get('holder_growth_fast', False),
+            'red_flags':             safety.get('red_flags', []),
         })
-        log.info(f"Saved signal #{signal_id}: {signal.get('name')}")
-        await notify_signal(signal, signal_id)
+
+        signal_id = save_signal(signal, {'total': 0, 'red_flags': safety.get('red_flags', [])})
+        log.info(f"Saved signal #{signal_id}: {signal.get('name')} — honeypot:{safety.get('is_honeypot')} meta:{trends.get('meta_theme')} tweets:{trends.get('recent_tweet_count')}")
+        await notify_signal(signal, socials, trends, safety, signal_id)
 
     asyncio.create_task(check_prices_loop())
     asyncio.create_task(daily_summary_loop())
