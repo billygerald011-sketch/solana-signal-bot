@@ -13,6 +13,7 @@ import json
 import os
 import websockets
 from datetime import datetime, timezone
+import httpx
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +89,26 @@ async def pumpportal_ws_loop(get_active_signals_fn, update_price_fn, milestone_c
                     async for message in ws:
                         try:
                             data = json.loads(message)
+
+                            # Extract and cache token metadata from WS stream
+                            if 'mint' in data and 'uri' in data:
+                                try:
+                                    from social_checker import store_ws_metadata
+                                    uri = data.get('uri', '')
+                                    if uri:
+                                        async with httpx.AsyncClient() as hc:
+                                            meta_r = await hc.get(uri, timeout=5)
+                                            if meta_r.status_code == 200:
+                                                meta = meta_r.json()
+                                                store_ws_metadata(data['mint'], {
+                                                    'twitter':  meta.get('twitter', '') or '',
+                                                    'telegram': meta.get('telegram', '') or '',
+                                                    'website':  meta.get('website', '') or '',
+                                                    'image':    meta.get('image', '') or '',
+                                                })
+                                except Exception as e:
+                                    log.warning(f"WS metadata extract failed: {e}")
+
                             if 'mint' not in data or 'marketCapSol' not in data:
                                 continue
 
