@@ -199,9 +199,19 @@ async def main():
         parse_mode=ParseMode.MARKDOWN
     )
 
-    @client.on(events.NewMessage(chats=CHANNEL))
+    @client.on(events.NewMessage())
     async def handler(event):
         text = event.message.message
+        # Filter to only our target channel
+        try:
+            chat = await event.get_chat()
+            chat_username = getattr(chat, 'username', '') or ''
+            chat_id = getattr(chat, 'id', 0)
+            if chat_username.lower() != CHANNEL.lower() and str(chat_id) != '2692939230':
+                return
+        except Exception:
+            pass
+
         if 'Marketcap' not in text:
             return
         log.info("Signal received, parsing...")
