@@ -1,7 +1,8 @@
 """
 Social Checker - Phase 1
+Gets social links from pump.fun API first (most reliable),
+then falls back to parsing signal message text.
 Checks Twitter, website, pump.fun replies, and Telegram group activity.
-All results saved to signal data for pattern analysis later.
 """
 
 import asyncio
@@ -13,8 +14,6 @@ log = logging.getLogger(__name__)
 
 
 async def check_url_live(session, url: str) -> bool:
-    if not url:
-        return False
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=6), allow_redirects=True) as r:
             return r.status == 200
@@ -70,15 +69,20 @@ async def check_twitter(session, twitter_url: str) -> dict:
     return result
 
 
-async def check_pumpfun(session, ca: str) -> dict:
+async def get_pumpfun_data(session, ca: str) -> dict:
+    """
+    Fetch full token data from pump.fun API.
+    This is our PRIMARY source for social links —
+    pump.fun stores twitter, telegram, website directly.
+    """
     result = {
-        'pumpfun_live': False,
-        'reply_count': 0,
+        'pumpfun_live':    False,
+        'reply_count':     0,
         'has_description': False,
-        'king_of_hill': False,
-        'telegram_url': '',
-        'twitter_url': '',
-        'website_url': '',
+        'king_of_hill':    False,
+        'twitter_url':     '',
+        'telegram_url':    '',
+        'website_url':     '',
     }
     if not ca:
         return result
@@ -90,24 +94,42 @@ async def check_pumpfun(session, ca: str) -> dict:
                 result['pumpfun_live']    = True
                 result['reply_count']     = d.get('reply_count', 0)
                 result['king_of_hill']    = d.get('is_currently_live', False)
-                result['has_description'] = len(d.get('description', '')) > 20
-                
-                # Extract all socials directly from pump.fun
-                result['telegram_url'] = d.get('telegram', '') or ''
-                result['twitter_url']  = d.get('twitter', '') or ''
-                result['website_url']  = d.get('website', '') or ''
+                result['has_description'] = len(d.get('description', '') or '') > 20
+
+                # ── Social links from pump.fun (most reliable source) ──
+                twitter  = d.get('twitter', '')  or ''
+                telegram = d.get('telegram', '') or ''
+                website  = d.get('website', '')  or ''
+
+                # Normalize Twitter URL
+                if twitter:
+                    if not twitter.startswith('http'):
+                        twitter = f"https://x.com/{twitter.lstrip('@')}"
+                    result['twitter_url'] = twitter
+
+                # Normalize Telegram URL
+                if telegram:
+                    if not telegram.startswith('http'):
+                        telegram = f"https://t.me/{telegram.lstrip('@')}"
+                    result['telegram_url'] = telegram
+
+                # Normalize website URL
+                if website:
+                    if not website.startswith('http'):
+                        website = f"https://{website}"
+                    result['website_url'] = website
+
     except Exception as e:
-        log.warning(f"pump.fun check failed: {e}")
+        log.warning(f"pump.fun data fetch failed for {ca}: {e}")
     return result
 
 
 async def check_telegram_group(client, telegram_url: str) -> dict:
-    """Use our existing Telethon client to check Telegram group size."""
+    """Use Telethon client to check Telegram group member count."""
     result = {'telegram_members': 0, 'telegram_active': False}
     if not telegram_url:
         return result
     try:
-        # Extract username from t.me/username
         match = re.search(r't\.me/([A-Za-z0-9_]+)', telegram_url)
         if not match:
             return result
@@ -122,54 +144,60 @@ async def check_telegram_group(client, telegram_url: str) -> dict:
 
 
 async def check_socials(signal: dict, tg_client=None) -> dict:
-    """Run all social checks and return combined data."""
+    """
+    Run all social checks.
+    Priority for links: pump.fun API > signal message text
+    """
     ca = signal.get('ca', '')
 
     async with aiohttp.ClientSession() as session:
-        # 1. Fetch pump.fun data FIRST to extract fallback URLs
-        pumpfun_data = await check_pumpfun(session, ca)
-        if not isinstance(pumpfun_data, dict):
-            pumpfun_data = {'pumpfun_live': False, 'reply_count': 0, 'telegram_url': '', 'twitter_url': '', 'website_url': ''}
+        # Always fetch pump.fun data first — it has the most reliable social links
+        pumpfun_data = await get_pumpfun_data(session, ca)
 
-        # 2. Consolidate URLs: Prefer signal URLs, fallback to pump.fun URLs
-        twitter_url = signal.get('twitter_url') or pumpfun_data.get('twitter_url', '')
-        website_url = signal.get('website_url') or pumpfun_data.get('website_url', '')
-        tg_url      = signal.get('telegram_url') or pumpfun_data.get('telegram_url', '')
+    # Merge links: pump.fun takes priority, fall back to signal message text
+    twitter_url  = pumpfun_data.get('twitter_url')  or signal.get('twitter_url', '')
+    telegram_url = pumpfun_data.get('telegram_url') or signal.get('telegram_url', '')
+    website_url  = pumpfun_data.get('website_url')  or signal.get('website_url', '')
 
-        # 3. Now run the Website and Twitter checks concurrently with our final URLs
+    log.info(f"Socials for {signal.get('name')}: twitter={bool(twitter_url)} tg={bool(telegram_url)} web={bool(website_url)}")
+
+    async with aiohttp.ClientSession() as session:
         twitter_task = check_twitter(session, twitter_url)
-        website_task = check_url_live(session, website_url)
+        website_task = check_url_live(session, website_url) if website_url else asyncio.sleep(0)
 
         twitter_data, website_live = await asyncio.gather(
             twitter_task, website_task,
             return_exceptions=True
         )
 
-    # 4. Handle any exceptions from gather
-    twitter_data  = twitter_data  if isinstance(twitter_data, dict)  else {'has_twitter': False, 'twitter_followers': 0, 'tweet_count': 0, 'is_active': False}
-    website_live  = website_live  if isinstance(website_live, bool)   else False
+    twitter_data = twitter_data if isinstance(twitter_data, dict) else {
+        'has_twitter': False, 'twitter_followers': 0,
+        'tweet_count': 0, 'is_active': False
+    }
+    website_live = website_live if isinstance(website_live, bool) else False
 
-    # 5. Get Telegram group info if we have a client and a final URL
+    # Check Telegram group members if we have a client
     tg_data = {'telegram_members': 0, 'telegram_active': False}
-    if tg_client and tg_url:
-        tg_data = await check_telegram_group(tg_client, tg_url)
-
-    # If we found a twitter URL on pump.fun but Nitter failed, let's still mark has_twitter as True
-    # so we know the project actually linked one. Nitter is notoriously flaky.
-    has_twitter_final = twitter_data.get('has_twitter', False) or bool(twitter_url)
+    if tg_client and telegram_url:
+        tg_data = await check_telegram_group(tg_client, telegram_url)
 
     return {
-        'has_twitter':       has_twitter_final,
+        # Links (merged from pump.fun + message)
         'twitter_url':       twitter_url,
+        'telegram_url':      telegram_url,
+        'website_url':       website_url,
+        # Twitter stats
+        'has_twitter':       twitter_data.get('has_twitter', False),
         'twitter_followers': twitter_data.get('twitter_followers', 0),
         'tweet_count':       twitter_data.get('tweet_count', 0),
         'twitter_active':    twitter_data.get('is_active', False),
+        # Website
         'website_live':      website_live,
-        'website_url':       website_url,
+        # pump.fun
         'pumpfun_replies':   pumpfun_data.get('reply_count', 0),
         'has_description':   pumpfun_data.get('has_description', False),
         'king_of_hill':      pumpfun_data.get('king_of_hill', False),
-        'telegram_url':      tg_url,
+        # Telegram
         'telegram_members':  tg_data.get('telegram_members', 0),
         'telegram_active':   tg_data.get('telegram_active', False),
     }

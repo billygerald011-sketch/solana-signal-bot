@@ -3,7 +3,7 @@ import re
 import os
 import logging
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timezone
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telegram import Bot
@@ -76,7 +76,7 @@ def parse_signal(text: str) -> dict | None:
             return None
 
         data['raw_text']  = text
-        data['timestamp'] = datetime.now(datetime.UTC).isoformat()        
+        data['timestamp'] = datetime.now(timezone.utc).isoformat()
         return data
     except Exception as e:
         log.error(f"Parse error: {e}")
@@ -152,7 +152,7 @@ async def check_prices_loop():
         for sig in signals:
             try:
                 entry_time   = datetime.fromisoformat(sig['timestamp'])
-                mins_elapsed = (datetime.utcnow() - entry_time).total_seconds() / 60
+                mins_elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
 
                 if   mins_elapsed <= 120:  check_now = True
                 elif mins_elapsed <= 360:  check_now = int(mins_elapsed) % 15 < 5

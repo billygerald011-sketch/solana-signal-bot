@@ -7,7 +7,7 @@ Tracks paper trade performance with extended time windows
 import json
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ def save_signal(signal: dict, score: dict):
         'id':                 len(data) + 1,
         'ca':                 signal.get('ca', ''),
         'name':               signal.get('name', 'Unknown'),
-        'timestamp':          signal.get('timestamp', datetime.utcnow().isoformat()),
+        'timestamp':          signal.get('timestamp', datetime.now(timezone.utc).isoformat()),
         'marketcap':          signal.get('marketcap', 0),
         'age_minutes':        signal.get('age_minutes', 0),
         'holders':            signal.get('holders', 0),
@@ -97,7 +97,7 @@ def update_price(ca: str, current_mcap: float, multiplier: float):
             # Calculate minutes since signal
             try:
                 entry_time   = datetime.fromisoformat(sig['timestamp'])
-                mins_elapsed = (datetime.utcnow() - entry_time).total_seconds() / 60
+                mins_elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
             except Exception:
                 mins_elapsed = 0
 
@@ -129,7 +129,7 @@ def update_price(ca: str, current_mcap: float, multiplier: float):
             sig['paper_pnl'] = round((multiplier - 1) * PAPER_BUY, 2)
 
             sig['price_history'].append({
-                'time':       datetime.utcnow().isoformat(),
+                'time':       datetime.now(timezone.utc).isoformat(),
                 'mins':       round(mins_elapsed),
                 'mcap':       current_mcap,
                 'multiplier': round(multiplier, 3),

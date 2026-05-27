@@ -11,7 +11,7 @@ import asyncio
 import aiohttp
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ async def check_holder_velocity(session, ca: str, current_holders: int) -> dict:
             if r.status == 200:
                 trades = await r.json()
                 if trades:
-                    now = datetime.utcnow()
+                    now = datetime.now(timezone.utc)
                     recent_buyers = set()
                     for t in trades:
                         try:
