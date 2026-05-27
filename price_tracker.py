@@ -1,10 +1,9 @@
 """
 Price Tracker
-Uses PumpPortal WebSocket to stream live trades for tracked tokens.
-Calculates real-time mcap from each trade event.
-No pump.fun HTTP needed — websocket is freely accessible from servers.
-
-Also uses Helius RPC as fallback for bonding curve math.
+Uses PumpPortal WebSocket with asyncio.Queue architecture.
+- Queue-based subscriptions (thread-safe, instant, crash-proof)
+- Auto-reconnects on disconnect
+- No global WS connection touching from outside
 """
 
 import asyncio
@@ -21,14 +20,14 @@ HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "2842e504-2c6d-41a1-b013-962ee
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 PUMPPORTAL_WS  = "wss://pumpportal.fun/api/data"
 
-# Global state — tracks live prices from websocket
-_live_prices: dict = {}   # ca -> {mcap, trade_count, last_update}
-_ws_subscriptions: set = set()
-_ws_connection = None
+# Global queue — bot.py puts CAs here, WS loop subscribes instantly
+subscription_queue: asyncio.Queue = asyncio.Queue()
+
+# Live trade data per CA
+_live_prices: dict = {}
 
 
 async def get_sol_price(session: aiohttp.ClientSession) -> float:
-    """Get SOL/USD price from CoinGecko."""
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
@@ -42,12 +41,12 @@ async def get_sol_price(session: aiohttp.ClientSession) -> float:
 
 async def pumpportal_ws_loop(get_active_signals_fn, update_price_fn, milestone_callback_fn):
     """
-    Main WebSocket loop — connects to PumpPortal and streams trades.
-    Auto-subscribes to new tokens as they come in.
-    Auto-reconnects on disconnect.
+    Main WebSocket loop with queue-based subscription architecture.
+    Two concurrent tasks:
+      1. subscribe_loop — drains the queue and subscribes instantly
+      2. read_loop — processes incoming trade events
+    Auto-reconnects on any error.
     """
-    global _ws_connection, _ws_subscriptions
-
     while True:
         try:
             log.info("Connecting to PumpPortal WebSocket...")
@@ -57,100 +56,107 @@ async def pumpportal_ws_loop(get_active_signals_fn, update_price_fn, milestone_c
                 ping_timeout=10,
                 close_timeout=5
             ) as ws:
-                _ws_connection = ws
                 log.info("PumpPortal WebSocket connected ✅")
 
-                # Subscribe to all currently tracked tokens
+                # Re-subscribe to all active tokens on reconnect
                 active = get_active_signals_fn()
                 for sig in active:
-                    ca = sig['ca']
-                    if ca not in _ws_subscriptions:
-                        await ws.send(json.dumps({
-                            "method": "subscribeTokenTrade",
-                            "keys": [ca]
-                        }))
-                        _ws_subscriptions.add(ca)
-                        log.info(f"Subscribed to trades for {sig.get('name','?')}")
+                    await subscription_queue.put(sig['ca'])
 
                 async with aiohttp.ClientSession() as session:
                     sol_price = await get_sol_price(session)
+                sol_price_updated = datetime.now(timezone.utc)
 
-                async for message in ws:
-                    try:
-                        data = json.loads(message)
+                async def subscribe_loop():
+                    """Drain subscription queue and subscribe instantly."""
+                    while True:
+                        ca = await subscription_queue.get()
+                        try:
+                            await ws.send(json.dumps({
+                                "method": "subscribeTokenTrade",
+                                "keys": [ca]
+                            }))
+                            log.info(f"⚡ Subscribed to {ca[:8]}...")
+                        except Exception as e:
+                            log.warning(f"Subscribe failed for {ca[:8]}: {e}")
+                            # Put back in queue for retry after reconnect
+                            await subscription_queue.put(ca)
 
-                        # Skip non-trade messages
-                        if 'mint' not in data or 'marketCapSol' not in data:
-                            continue
+                async def read_loop():
+                    """Process incoming trade events."""
+                    nonlocal sol_price, sol_price_updated
+                    async for message in ws:
+                        try:
+                            data = json.loads(message)
+                            if 'mint' not in data or 'marketCapSol' not in data:
+                                continue
 
-                        ca         = data['mint']
-                        mcap_sol   = float(data.get('marketCapSol', 0))
-                        mcap_usd   = mcap_sol * sol_price
-                        is_buy     = data.get('txType') == 'buy'
+                            ca       = data['mint']
+                            mcap_sol = float(data.get('marketCapSol', 0))
+                            is_buy   = data.get('txType') == 'buy'
 
-                        # Update live prices
-                        if ca not in _live_prices:
-                            _live_prices[ca] = {
-                                'mcap':        mcap_usd,
-                                'trade_count': 0,
-                                'buy_count':   0,
-                                'sell_count':  0,
-                                'last_update': datetime.now(timezone.utc).isoformat()
-                            }
-                        _live_prices[ca]['mcap']        = mcap_usd
-                        _live_prices[ca]['trade_count'] += 1
-                        _live_prices[ca]['last_update'] = datetime.now(timezone.utc).isoformat()
-                        if is_buy:
-                            _live_prices[ca]['buy_count']  += 1
-                        else:
-                            _live_prices[ca]['sell_count'] += 1
+                            # Refresh SOL price every 5 mins
+                            now = datetime.now(timezone.utc)
+                            if (now - sol_price_updated).total_seconds() > 300:
+                                async with aiohttp.ClientSession() as s:
+                                    sol_price = await get_sol_price(s)
+                                sol_price_updated = now
 
-                        # Find the signal and update price
-                        active = get_active_signals_fn()
-                        for sig in active:
-                            if sig['ca'] == ca:
-                                entry_mcap = sig['marketcap']
-                                if entry_mcap > 0:
-                                    multiplier = mcap_usd / entry_mcap
-                                    update_price_fn(ca, mcap_usd, multiplier)
-                                    # Check milestones
-                                    prev = sig.get('peak_multiplier', 0)
-                                    for milestone in [2, 5, 10, 20, 50, 100]:
-                                        if multiplier >= milestone and prev < milestone:
-                                            entry_time   = datetime.fromisoformat(sig['timestamp'])
-                                            mins_elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
-                                            await milestone_callback_fn(sig, milestone, mcap_usd, round(mins_elapsed))
-                                break
+                            mcap_usd = mcap_sol * sol_price
 
-                    except Exception as e:
-                        log.warning(f"Trade message processing failed: {e}")
+                            # Update live prices
+                            if ca not in _live_prices:
+                                _live_prices[ca] = {
+                                    'mcap': mcap_usd,
+                                    'trade_count': 0,
+                                    'buy_count': 0,
+                                    'sell_count': 0,
+                                    'last_update': now.isoformat()
+                                }
+                            p = _live_prices[ca]
+                            p['mcap']        = mcap_usd
+                            p['trade_count'] += 1
+                            p['last_update'] = now.isoformat()
+                            if is_buy: p['buy_count']  += 1
+                            else:      p['sell_count'] += 1
+
+                            # Update tracker and check milestones
+                            active = get_active_signals_fn()
+                            for sig in active:
+                                if sig['ca'] == ca:
+                                    entry_mcap = sig['marketcap']
+                                    if entry_mcap > 0:
+                                        multiplier = mcap_usd / entry_mcap
+                                        update_price_fn(ca, mcap_usd, multiplier)
+                                        prev = sig.get('peak_multiplier', 0)
+                                        for milestone in [2, 5, 10, 20, 50, 100]:
+                                            if multiplier >= milestone and prev < milestone:
+                                                entry_time   = datetime.fromisoformat(sig['timestamp'])
+                                                mins_elapsed = (now - entry_time).total_seconds() / 60
+                                                await milestone_callback_fn(sig, milestone, mcap_usd, round(mins_elapsed))
+                                    break
+
+                        except Exception as e:
+                            log.warning(f"Trade message error: {e}")
+
+                # Run both loops concurrently
+                await asyncio.gather(subscribe_loop(), read_loop())
 
         except Exception as e:
             log.warning(f"PumpPortal WebSocket error: {e} — reconnecting in 5s")
-            _ws_connection = None
             await asyncio.sleep(5)
 
 
 async def subscribe_token(ca: str):
-    """Subscribe to live trades for a new token."""
-    global _ws_connection, _ws_subscriptions
-    if ca in _ws_subscriptions:
-        return
-    _ws_subscriptions.add(ca)
-    if _ws_connection:
-        try:
-            await _ws_connection.send(json.dumps({
-                "method": "subscribeTokenTrade",
-                "keys": [ca]
-            }))
-            log.info(f"Subscribed to trades: {ca[:8]}...")
-        except Exception as e:
-            log.warning(f"Failed to subscribe to {ca[:8]}: {e}")
-            _ws_subscriptions.discard(ca)
+    """
+    Instantly queue a CA for WebSocket subscription.
+    Called the moment a CA is parsed — before any safety checks run.
+    """
+    await subscription_queue.put(ca)
+    log.info(f"⚡ Queued subscription for {ca[:8]}...")
 
 
 def get_live_trade_count(ca: str) -> dict:
-    """Get live trade stats for a token from websocket data."""
     return _live_prices.get(ca, {
         'mcap': 0, 'trade_count': 0,
         'buy_count': 0, 'sell_count': 0
@@ -158,18 +164,13 @@ def get_live_trade_count(ca: str) -> dict:
 
 
 async def get_token_market_cap_helius(mint: str) -> float | None:
-    """
-    Fallback: read bonding curve directly from Solana blockchain via Helius.
-    Used when websocket hasn't received data for a token yet.
-    """
+    """Fallback: read bonding curve from Solana blockchain via Helius."""
     import struct, base64
     try:
         async with aiohttp.ClientSession() as session:
             sol_price = await get_sol_price(session)
-
             payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
+                "jsonrpc": "2.0", "id": 1,
                 "method": "getProgramAccounts",
                 "params": [
                     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
@@ -182,11 +183,8 @@ async def get_token_market_cap_helius(mint: str) -> float | None:
                     }
                 ]
             }
-            async with session.post(
-                HELIUS_RPC_URL,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
+            async with session.post(HELIUS_RPC_URL, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     data = await r.json()
                     accounts = data.get('result', [])
@@ -198,8 +196,7 @@ async def get_token_market_cap_helius(mint: str) -> float | None:
                             vsr = struct.unpack_from('<Q', raw, offset)[0]
                             if vtr > 0:
                                 price_sol = (vsr / 1e9) / (vtr / 1e6)
-                                mcap      = price_sol * 1_000_000_000 * sol_price
-                                return round(mcap, 2)
+                                return round(price_sol * 1_000_000_000 * sol_price, 2)
     except Exception as e:
         log.warning(f"Helius fallback failed for {mint}: {e}")
     return None
