@@ -77,7 +77,7 @@ async def check_twitter_mentions(session, name: str, ticker: str) -> dict:
     return result
 
 
-async def check_google_trends(name: str) -> dict:
+def check_google_trends(name: str) -> dict:
     """Check Google Trends for the token name."""
     result = {'google_trending': False, 'google_interest': 0}
     try:
@@ -125,7 +125,7 @@ def check_same_meta(signal: dict) -> dict:
         result['meta_theme'] = detected_theme
 
         # Check how same-theme coins performed today
-        today = datetime.utcnow().date().isoformat()
+        today = datetime.now(datetime.UTC).date().isoformat()
         all_signals = get_all_signals()
         same_theme_today = []
 
@@ -159,9 +159,10 @@ async def check_volume_velocity(session, ca: str, current_volume: int) -> dict:
                 trades = await r.json()
                 if trades and len(trades) >= 5:
                     # Count trades in last 5 mins vs 5 mins before that
-                    now = datetime.utcnow()
+                    now = datetime.now(datetime.UTC)
+                    # Note: Assuming pump.fun timestamps are in UTC
                     recent = sum(1 for t in trades
-                                if (now - datetime.fromisoformat(
+                                if (now.replace(tzinfo=None) - datetime.fromisoformat(
                                     t.get('timestamp','').replace('Z','')
                                 )).total_seconds() < 300
                                 ) if trades else 0

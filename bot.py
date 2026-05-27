@@ -76,7 +76,7 @@ def parse_signal(text: str) -> dict | None:
             return None
 
         data['raw_text']  = text
-        data['timestamp'] = datetime.utcnow().isoformat()
+        data['timestamp'] = datetime.now(datetime.UTC).isoformat()        
         return data
     except Exception as e:
         log.error(f"Parse error: {e}")

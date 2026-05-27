@@ -160,10 +160,12 @@ async def check_socials(signal: dict, tg_client=None) -> dict:
 
     return {
         'has_twitter':       has_twitter_final,
+        'twitter_url':       twitter_url,
         'twitter_followers': twitter_data.get('twitter_followers', 0),
         'tweet_count':       twitter_data.get('tweet_count', 0),
         'twitter_active':    twitter_data.get('is_active', False),
         'website_live':      website_live,
+        'website_url':       website_url,
         'pumpfun_replies':   pumpfun_data.get('reply_count', 0),
         'has_description':   pumpfun_data.get('has_description', False),
         'king_of_hill':      pumpfun_data.get('king_of_hill', False),
